@@ -10,6 +10,7 @@ import (
 
 	"log/slog"
 
+	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -32,16 +33,23 @@ type DataPayload struct {
 }
 
 type DataProxy struct {
-	ProxyKey string `json:"proxy_key"`
-	Name     string `json:"name"`
-	Protocol string `json:"protocol"`
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	Username string `json:"username,omitempty"`
-	Password string `json:"password,omitempty"`
-	Status   string `json:"status"`
+	ProxyKey        string `json:"proxy_key"`
+	Name            string `json:"name"`
+	Protocol        string `json:"protocol"`
+	Host            string `json:"host"`
+	Port            int    `json:"port"`
+	Username        string `json:"username,omitempty"`
+	Password        string `json:"password,omitempty"`
+	Status          string `json:"status"`
+	ExpiresAt       *int64 `json:"expires_at,omitempty"`        // unix 秒，与 DataAccount.ExpiresAt 风格一致
+	FallbackMode    string `json:"fallback_mode,omitempty"`     // none/direct/proxy
+	BackupProxyName string `json:"backup_proxy_name,omitempty"` // 备用代理 name（跨实例按 name 反查）
+	ExpiryWarnDays  int    `json:"expiry_warn_days,omitempty"`
 }
 
+// DataAccount 是管理员显式备份导出使用的账号结构，故意不走 dto.Account 的脱敏路径，
+// Credentials 原文返回。这是"管理员备份"这一显式行为的一部分；如未来需要导出脱敏版本，
+// 应新增独立结构而非修改这里。
 type DataAccount struct {
 	Name               string         `json:"name"`
 	Notes              *string        `json:"notes,omitempty"`
@@ -114,21 +122,41 @@ func (h *AccountHandler) ExportData(c *gin.Context) {
 		proxies = []service.Proxy{}
 	}
 
+	// 构建 id→name 映射，用于导出备用代理 name
+	proxyNameByID := make(map[int64]string, len(proxies))
+	for i := range proxies {
+		proxyNameByID[proxies[i].ID] = proxies[i].Name
+	}
+
 	proxyKeyByID := make(map[int64]string, len(proxies))
 	dataProxies := make([]DataProxy, 0, len(proxies))
 	for i := range proxies {
 		p := proxies[i]
 		key := buildProxyKey(p.Protocol, p.Host, p.Port, p.Username, p.Password)
 		proxyKeyByID[p.ID] = key
+
+		var expiresAt *int64
+		if p.ExpiresAt != nil {
+			v := p.ExpiresAt.Unix()
+			expiresAt = &v
+		}
+		var backupProxyName string
+		if p.BackupProxyID != nil {
+			backupProxyName = proxyNameByID[*p.BackupProxyID]
+		}
 		dataProxies = append(dataProxies, DataProxy{
-			ProxyKey: key,
-			Name:     p.Name,
-			Protocol: p.Protocol,
-			Host:     p.Host,
-			Port:     p.Port,
-			Username: p.Username,
-			Password: p.Password,
-			Status:   p.Status,
+			ProxyKey:        key,
+			Name:            p.Name,
+			Protocol:        p.Protocol,
+			Host:            p.Host,
+			Port:            p.Port,
+			Username:        p.Username,
+			Password:        p.Password,
+			Status:          p.Status,
+			ExpiresAt:       expiresAt,
+			FallbackMode:    p.FallbackMode,
+			BackupProxyName: backupProxyName,
+			ExpiryWarnDays:  p.ExpiryWarnDays,
 		})
 	}
 
@@ -203,10 +231,15 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 	}
 
 	proxyKeyToID := make(map[string]int64, len(existingProxies))
+	// proxyNameToID 用于 backup_proxy_name 反查：DB 已有 + 本批次新建均会写入
+	proxyNameToID := make(map[string]int64, len(existingProxies))
 	for i := range existingProxies {
 		p := existingProxies[i]
 		key := buildProxyKey(p.Protocol, p.Host, p.Port, p.Username, p.Password)
 		proxyKeyToID[key] = p.ID
+		if p.Name != "" {
+			proxyNameToID[p.Name] = p.ID
+		}
 	}
 
 	for i := range dataPayload.Proxies {
@@ -231,21 +264,76 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 			result.ProxyReused++
 			if normalizedStatus != "" {
 				if proxy, getErr := h.adminService.GetProxy(ctx, existingID); getErr == nil && proxy != nil && proxy.Status != normalizedStatus {
+					// 同步 status 时传入完整字段，避免零值覆盖已存在代理的有效期/fallback 配置。
+					var existingExpiresAt *time.Time
+					if item.ExpiresAt != nil {
+						t := time.Unix(*item.ExpiresAt, 0).UTC()
+						existingExpiresAt = &t
+					}
+					existingFallbackMode := item.FallbackMode
+					if existingFallbackMode == "" {
+						existingFallbackMode = service.FallbackModeNone
+					}
+					var existingBackupProxyID *int64
+					if item.BackupProxyName != "" {
+						if bid, ok := proxyNameToID[item.BackupProxyName]; ok {
+							existingBackupProxyID = &bid
+						}
+					}
 					_, _ = h.adminService.UpdateProxy(ctx, existingID, &service.UpdateProxyInput{
-						Status: normalizedStatus,
+						Status:         normalizedStatus,
+						ExpiresAt:      existingExpiresAt,
+						FallbackMode:   existingFallbackMode,
+						BackupProxyID:  existingBackupProxyID,
+						ExpiryWarnDays: item.ExpiryWarnDays,
+						Name:           proxy.Name,
+						Protocol:       proxy.Protocol,
+						Host:           proxy.Host,
+						Port:           proxy.Port,
+						Username:       proxy.Username,
+						Password:       proxy.Password,
 					})
 				}
 			}
 			continue
 		}
 
+		// 解析 expires_at（unix 秒 → *time.Time）
+		var expiresAt *time.Time
+		if item.ExpiresAt != nil {
+			t := time.Unix(*item.ExpiresAt, 0).UTC()
+			expiresAt = &t
+		}
+
+		// 解析 backup_proxy_name → backup_proxy_id
+		fallbackMode := item.FallbackMode
+		var backupProxyID *int64
+		if item.BackupProxyName != "" {
+			if bid, ok := proxyNameToID[item.BackupProxyName]; ok {
+				backupProxyID = &bid
+			} else {
+				// 查不到备用代理：降级 fallback_mode=none，记录 warning
+				fallbackMode = service.FallbackModeNone
+				result.Errors = append(result.Errors, DataImportError{
+					Kind:     "proxy",
+					Name:     item.Name,
+					ProxyKey: key,
+					Message:  fmt.Sprintf("backup_proxy_name %q not found, fallback_mode downgraded to none", item.BackupProxyName),
+				})
+			}
+		}
+
 		created, createErr := h.adminService.CreateProxy(ctx, &service.CreateProxyInput{
-			Name:     defaultProxyName(item.Name),
-			Protocol: item.Protocol,
-			Host:     item.Host,
-			Port:     item.Port,
-			Username: item.Username,
-			Password: item.Password,
+			Name:           defaultProxyName(item.Name),
+			Protocol:       item.Protocol,
+			Host:           item.Host,
+			Port:           item.Port,
+			Username:       item.Username,
+			Password:       item.Password,
+			ExpiresAt:      expiresAt,
+			FallbackMode:   fallbackMode,
+			BackupProxyID:  backupProxyID,
+			ExpiryWarnDays: item.ExpiryWarnDays,
 		})
 		if createErr != nil {
 			result.ProxyFailed++
@@ -258,14 +346,32 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 			continue
 		}
 		proxyKeyToID[key] = created.ID
+		// 把新建代理的 name 也加入反查表，供后续批内代理引用
+		if created.Name != "" {
+			proxyNameToID[created.Name] = created.ID
+		}
 		result.ProxyCreated++
 
 		if normalizedStatus != "" && normalizedStatus != created.Status {
+			// 新建后同步 status 时，传入完整字段，避免零值覆盖刚创建的有效期/fallback 配置。
 			_, _ = h.adminService.UpdateProxy(ctx, created.ID, &service.UpdateProxyInput{
-				Status: normalizedStatus,
+				Status:         normalizedStatus,
+				ExpiresAt:      expiresAt,
+				FallbackMode:   fallbackMode,
+				BackupProxyID:  backupProxyID,
+				ExpiryWarnDays: item.ExpiryWarnDays,
+				Name:           created.Name,
+				Protocol:       created.Protocol,
+				Host:           created.Host,
+				Port:           created.Port,
+				Username:       created.Username,
+				Password:       created.Password,
 			})
 		}
 	}
+
+	// 收集需要异步设置隐私的 Antigravity OAuth 账号
+	var privacyAccounts []*service.Account
 
 	for i := range dataPayload.Accounts {
 		item := dataPayload.Accounts[i]
@@ -314,7 +420,8 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 			SkipDefaultGroupBind: skipDefaultGroupBind,
 		}
 
-		if _, err := h.adminService.CreateAccount(ctx, accountInput); err != nil {
+		created, err := h.adminService.CreateAccount(ctx, accountInput)
+		if err != nil {
 			result.AccountFailed++
 			result.Errors = append(result.Errors, DataImportError{
 				Kind:    "account",
@@ -323,7 +430,28 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 			})
 			continue
 		}
+		// 收集 Antigravity OAuth 账号，稍后异步设置隐私
+		if created.Platform == service.PlatformAntigravity && created.Type == service.AccountTypeOAuth {
+			privacyAccounts = append(privacyAccounts, created)
+		}
 		result.AccountCreated++
+	}
+
+	// 异步设置 Antigravity 隐私，避免大量导入时阻塞请求
+	if len(privacyAccounts) > 0 {
+		adminSvc := h.adminService
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("import_antigravity_privacy_panic", "recover", r)
+				}
+			}()
+			bgCtx := context.Background()
+			for _, acc := range privacyAccounts {
+				adminSvc.ForceAntigravityPrivacy(bgCtx, acc)
+			}
+			slog.Info("import_antigravity_privacy_done", "count", len(privacyAccounts))
+		}()
 	}
 
 	return result, nil
@@ -334,7 +462,7 @@ func (h *AccountHandler) listAllProxies(ctx context.Context) ([]service.Proxy, e
 	pageSize := dataPageCap
 	var out []service.Proxy
 	for {
-		items, total, err := h.adminService.ListProxies(ctx, page, pageSize, "", "", "")
+		items, total, err := h.adminService.ListProxies(ctx, page, pageSize, "", "", "", "created_at", "desc")
 		if err != nil {
 			return nil, err
 		}
@@ -347,12 +475,12 @@ func (h *AccountHandler) listAllProxies(ctx context.Context) ([]service.Proxy, e
 	return out, nil
 }
 
-func (h *AccountHandler) listAccountsFiltered(ctx context.Context, platform, accountType, status, search string) ([]service.Account, error) {
+func (h *AccountHandler) listAccountsFiltered(ctx context.Context, platform, accountType, status, search string, groupID int64, privacyMode, sortBy, sortOrder string) ([]service.Account, error) {
 	page := 1
 	pageSize := dataPageCap
 	var out []service.Account
 	for {
-		items, total, err := h.adminService.ListAccounts(ctx, page, pageSize, platform, accountType, status, search, 0, "")
+		items, total, err := h.adminService.ListAccounts(ctx, page, pageSize, platform, accountType, status, search, groupID, privacyMode, sortBy, sortOrder)
 		if err != nil {
 			return nil, err
 		}
@@ -384,11 +512,28 @@ func (h *AccountHandler) resolveExportAccounts(ctx context.Context, ids []int64,
 	platform := c.Query("platform")
 	accountType := c.Query("type")
 	status := c.Query("status")
+	privacyMode := strings.TrimSpace(c.Query("privacy_mode"))
 	search := strings.TrimSpace(c.Query("search"))
+	sortBy := c.DefaultQuery("sort_by", "name")
+	sortOrder := c.DefaultQuery("sort_order", "asc")
 	if len(search) > 100 {
 		search = search[:100]
 	}
-	return h.listAccountsFiltered(ctx, platform, accountType, status, search)
+
+	groupID := int64(0)
+	if groupIDStr := c.Query("group"); groupIDStr != "" {
+		if groupIDStr == accountListGroupUngroupedQueryValue {
+			groupID = service.AccountListGroupUngrouped
+		} else {
+			parsedGroupID, parseErr := strconv.ParseInt(groupIDStr, 10, 64)
+			if parseErr != nil || parsedGroupID <= 0 {
+				return nil, infraerrors.BadRequest("INVALID_GROUP_FILTER", "invalid group filter")
+			}
+			groupID = parsedGroupID
+		}
+	}
+
+	return h.listAccountsFiltered(ctx, platform, accountType, status, search, groupID, privacyMode, sortBy, sortOrder)
 }
 
 func (h *AccountHandler) resolveExportProxies(ctx context.Context, accounts []service.Account) ([]service.Proxy, error) {
@@ -542,15 +687,15 @@ func defaultProxyName(name string) string {
 
 // enrichCredentialsFromIDToken performs best-effort extraction of user info fields
 // (email, plan_type, chatgpt_account_id, etc.) from id_token in credentials.
-// Only applies to OpenAI/Sora OAuth accounts. Skips expired token errors silently.
+// Only applies to OpenAI OAuth accounts. Skips expired token errors silently.
 // Existing credential values are never overwritten — only missing fields are filled.
 func enrichCredentialsFromIDToken(item *DataAccount) {
 	if item.Credentials == nil {
 		return
 	}
-	// Only enrich OpenAI/Sora OAuth accounts
+	// Only enrich OpenAI OAuth accounts
 	platform := strings.ToLower(strings.TrimSpace(item.Platform))
-	if platform != service.PlatformOpenAI && platform != service.PlatformSora {
+	if platform != service.PlatformOpenAI {
 		return
 	}
 	if strings.ToLower(strings.TrimSpace(item.Type)) != service.AccountTypeOAuth {
@@ -599,6 +744,9 @@ func normalizeProxyStatus(status string) string {
 	case service.StatusActive:
 		return service.StatusActive
 	case "inactive", service.StatusDisabled:
+		return "inactive"
+	case "expired":
+		// 导入 expired 代理按 inactive 处理，避免导入即触发到期改投逻辑
 		return "inactive"
 	default:
 		return normalized

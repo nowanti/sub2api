@@ -1,5 +1,5 @@
 <template>
-  <div class="md:hidden space-y-3">
+  <div v-if="!isDesktopViewport" class="space-y-3">
     <template v-if="loading">
       <div v-for="i in 5" :key="i" class="rounded-lg border border-gray-200 bg-white p-4 dark:border-dark-700 dark:bg-dark-900">
         <div class="space-y-3">
@@ -61,14 +61,15 @@
   </div>
 
   <div
+    v-else
     ref="tableWrapperRef"
-    class="table-wrapper hidden md:block"
+    class="table-wrapper"
     :class="{
       'actions-expanded': actionsExpanded,
       'is-scrollable': isScrollable
     }"
   >
-    <table class="min-w-full divide-y divide-gray-200 dark:divide-dark-700">
+    <table class="w-full min-w-max divide-y divide-gray-200 dark:divide-dark-700">
       <thead class="table-header bg-gray-50 dark:bg-dark-800">
         <tr>
           <th
@@ -196,12 +197,17 @@
 
 <script setup lang="ts">
 import { computed, ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
-import { useVirtualizer } from '@tanstack/vue-virtual'
+import { useVirtualizer, observeElementRect as observeElementRectDefault } from '@tanstack/vue-virtual'
 import { useI18n } from 'vue-i18n'
 import type { Column } from './types'
 import Icon from '@/components/icons/Icon.vue'
 
 const { t } = useI18n()
+
+const desktopViewportQuery = '(min-width: 768px)'
+const isDesktopViewport = ref(
+  typeof window === 'undefined' ? true : window.matchMedia(desktopViewportQuery).matches
+)
 
 const emit = defineEmits<{
   sort: [key: string, order: 'asc' | 'desc']
@@ -211,6 +217,27 @@ const emit = defineEmits<{
 const tableWrapperRef = ref<HTMLElement | null>(null)
 const isScrollable = ref(false)
 const actionsColumnNeedsExpanding = ref(false)
+
+// --- 虚拟滚动「整表空白」根治 ---
+// 根因:本组件根 .table-wrapper 为 flex:1 / min-h-0,高度由父级 flex 链决定。@tanstack 虚拟化器
+// 仅在 observeElementRect 回调里写 scrollRect;一旦该回调读到 0 高度(加载瞬间 flex 未结算,或
+// 滚动中动态行高校正触发的 reflow),scrollRect 被钉死为 0 → calculateRange 返回 null → 整表空白。
+// 对策(见下方 virtualizer 选项):
+//   1) 覆写 observeElementRect,直接丢弃 height<=0 的读数,scrollRect 永不被钉成 0;
+//   2) initialRect 给一屏兜底高度,首个有效读数到来前也有行可渲染,绝不空白。
+// 兜底高度:表格区域大致 = 视口高度 - 顶栏/外边距/筛选/分页 ≈ 320px
+const estimatedViewportHeight = () => {
+  if (typeof window === 'undefined') return 600
+  return Math.max(window.innerHeight - 320, 400)
+}
+
+// 覆写默认 observeElementRect:过滤掉 0 高度读数(根治整表空白的关键)
+const observeElementRectNonZero = (
+  instance: any,
+  cb: (rect: { width: number; height: number }) => void
+) => observeElementRectDefault(instance, (rect) => {
+  if (rect.height > 0) cb(rect)
+})
 
 // 检查是否可滚动
 const checkScrollable = () => {
@@ -268,8 +295,19 @@ const checkActionsColumnWidth = () => {
 // 监听尺寸变化
 let resizeObserver: ResizeObserver | null = null
 let resizeHandler: (() => void) | null = null
+let desktopViewportMediaQuery: MediaQueryList | null = null
+let desktopViewportListener: ((event: MediaQueryListEvent) => void) | null = null
 
-onMounted(() => {
+const detachDesktopTableTracking = () => {
+  resizeObserver?.disconnect()
+  resizeObserver = null
+  if (resizeHandler) {
+    window.removeEventListener('resize', resizeHandler)
+    resizeHandler = null
+  }
+}
+
+const attachDesktopTableTracking = () => {
   checkScrollable()
   checkActionsColumnWidth()
   if (tableWrapperRef.value && typeof ResizeObserver !== 'undefined') {
@@ -286,14 +324,34 @@ onMounted(() => {
     }
     window.addEventListener('resize', resizeHandler)
   }
+}
+
+onMounted(() => {
+  if (typeof window !== 'undefined') {
+    desktopViewportMediaQuery = window.matchMedia(desktopViewportQuery)
+    isDesktopViewport.value = desktopViewportMediaQuery.matches
+    desktopViewportListener = (event: MediaQueryListEvent) => {
+      isDesktopViewport.value = event.matches
+    }
+    if (typeof desktopViewportMediaQuery.addEventListener === 'function') {
+      desktopViewportMediaQuery.addEventListener('change', desktopViewportListener)
+    } else {
+      desktopViewportMediaQuery.addListener(desktopViewportListener)
+    }
+  }
 })
 
 onUnmounted(() => {
-  resizeObserver?.disconnect()
-  if (resizeHandler) {
-    window.removeEventListener('resize', resizeHandler)
-    resizeHandler = null
+  detachDesktopTableTracking()
+  if (desktopViewportMediaQuery && desktopViewportListener) {
+    if (typeof desktopViewportMediaQuery.removeEventListener === 'function') {
+      desktopViewportMediaQuery.removeEventListener('change', desktopViewportListener)
+    } else {
+      desktopViewportMediaQuery.removeListener(desktopViewportListener)
+    }
+    desktopViewportListener = null
   }
+  desktopViewportMediaQuery = null
 })
 
 interface Props {
@@ -470,6 +528,17 @@ const columnsSignature = computed(() =>
   props.columns.map((column) => `${column.key}:${column.sortable ? '1' : '0'}`).join('|')
 )
 
+watch(
+  isDesktopViewport,
+  async (isDesktop) => {
+    detachDesktopTableTracking()
+    if (!isDesktop) return
+    await nextTick()
+    attachDesktopTableTracking()
+  },
+  { immediate: true, flush: 'post' }
+)
+
 // 数据/列变化时重新检查滚动状态
 // 注意：不能监听 actionsExpanded，因为 checkActionsColumnWidth 会临时修改它，会导致无限循环
 watch(
@@ -526,10 +595,16 @@ const sortedData = computed(() => {
 
 // --- Virtual scrolling ---
 const rowVirtualizer = useVirtualizer(computed(() => ({
-  count: sortedData.value?.length ?? 0,
+  count: isDesktopViewport.value ? (sortedData.value?.length ?? 0) : 0,
   getScrollElement: () => tableWrapperRef.value,
   estimateSize: () => props.estimateRowHeight ?? 56,
   overscan: props.overscan ?? 5,
+  // 兜底高度:首个有效高度读数到来前,先按一屏渲染,避免空白帧
+  initialRect: { width: 0, height: estimatedViewportHeight() },
+  // 关键:过滤 0 高度读数,杜绝 scrollRect 被钉成 0 → calculateRange 返回 null → 整表空白
+  observeElementRect: observeElementRectNonZero,
+  // 把测量类 ResizeObserver 回调批到 rAF,避免滚动中同步 reflow 风暴导致的校正抖动/空白
+  useAnimationFrameWithResizeObserver: true,
 })))
 
 const virtualItems = computed(() => rowVirtualizer.value.getVirtualItems())
@@ -795,5 +870,64 @@ tbody tr:hover .sticky-col {
 
 .dark .is-scrollable .sticky-col-right::before {
   background: linear-gradient(to left, rgba(0, 0, 0, 0.2), transparent);
+}
+</style>
+
+<style>
+/* ==========================================================================
+   终极悬浮滚动条防丢器 (Sledgehammer Override)
+   绕过 style.css 中 `* { scrollbar-color: transparent }` 的全局悬停隐身诅咒！
+   ========================================================================== */
+
+/* 1. 废除全局针对所有元素的 scrollbar-width 设定，拿回 Chrome/Safari 下 Webkit 滚动条规则的控制权！ */
+.table-wrapper {
+  scrollbar-width: auto !important; /* 阻止 Chrome 121 退化到原生 Mac 闪隐滚动条 */
+}
+
+/* 2. 重写 Webkit 滚动层，全部加上 !important 强制覆盖透明悬停陷阱 */
+.table-wrapper::-webkit-scrollbar {
+  height: 12px !important;
+  width: 12px !important;
+  display: block !important;
+  background-color: transparent !important;
+}
+
+.table-wrapper::-webkit-scrollbar-track {
+  background-color: rgba(0, 0, 0, 0.03) !important;
+  border-radius: 6px !important;
+  margin: 0 4px !important;
+}
+.dark .table-wrapper::-webkit-scrollbar-track {
+  background-color: rgba(255, 255, 255, 0.05) !important;
+}
+
+/* 常驻、不透明的滑块，无视鼠标是否 hover 都在那！ */
+.table-wrapper::-webkit-scrollbar-thumb {
+  background-color: rgba(107, 114, 128, 0.75) !important; 
+  border-radius: 6px !important;
+  border: 2px solid transparent !important;
+  background-clip: padding-box !important;
+  -webkit-appearance: none !important;
+}
+.table-wrapper::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(75, 85, 99, 0.9) !important;
+}
+
+.dark .table-wrapper::-webkit-scrollbar-thumb {
+  background-color: rgba(156, 163, 175, 0.75) !important;
+}
+.dark .table-wrapper::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(209, 213, 219, 0.9) !important;
+}
+
+/* 3. 仅给真正的 Firefox 留的后路 */
+@supports (-moz-appearance:none) {
+  .table-wrapper {
+    scrollbar-width: thin !important;
+    scrollbar-color: rgba(156, 163, 175, 0.5) rgba(0, 0, 0, 0.03) !important;
+  }
+  .dark .table-wrapper {
+    scrollbar-color: rgba(75, 85, 99, 0.5) rgba(255, 255, 255, 0.05) !important;
+  }
 }
 </style>

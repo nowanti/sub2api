@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -26,13 +27,13 @@ var (
 
 // 默认指纹值（当客户端未提供时使用）
 var defaultFingerprint = Fingerprint{
-	UserAgent:               "claude-cli/2.1.22 (external, cli)",
+	UserAgent:               "claude-cli/" + claude.CLICurrentVersion + " (external, cli)",
 	StainlessLang:           "js",
-	StainlessPackageVersion: "0.70.0",
+	StainlessPackageVersion: "0.94.0",
 	StainlessOS:             "Linux",
 	StainlessArch:           "arm64",
 	StainlessRuntime:        "node",
-	StainlessRuntimeVersion: "v24.13.0",
+	StainlessRuntimeVersion: "v24.3.0",
 }
 
 // Fingerprint represents account fingerprint data
@@ -174,6 +175,7 @@ func getHeaderOrDefault(headers http.Header, key, defaultValue string) string {
 }
 
 // ApplyFingerprint 将指纹应用到请求头（覆盖原有的x-stainless-*头）
+// 使用 setHeaderRaw 保持原始大小写（如 X-Stainless-OS 而非 X-Stainless-Os）
 func (s *IdentityService) ApplyFingerprint(req *http.Request, fp *Fingerprint) {
 	if fp == nil {
 		return
@@ -181,27 +183,27 @@ func (s *IdentityService) ApplyFingerprint(req *http.Request, fp *Fingerprint) {
 
 	// 设置user-agent
 	if fp.UserAgent != "" {
-		req.Header.Set("user-agent", fp.UserAgent)
+		setHeaderRaw(req.Header, "User-Agent", fp.UserAgent)
 	}
 
-	// 设置x-stainless-*头
+	// 设置x-stainless-*头（保持与 claude.DefaultHeaders 一致的大小写）
 	if fp.StainlessLang != "" {
-		req.Header.Set("X-Stainless-Lang", fp.StainlessLang)
+		setHeaderRaw(req.Header, "X-Stainless-Lang", fp.StainlessLang)
 	}
 	if fp.StainlessPackageVersion != "" {
-		req.Header.Set("X-Stainless-Package-Version", fp.StainlessPackageVersion)
+		setHeaderRaw(req.Header, "X-Stainless-Package-Version", fp.StainlessPackageVersion)
 	}
 	if fp.StainlessOS != "" {
-		req.Header.Set("X-Stainless-OS", fp.StainlessOS)
+		setHeaderRaw(req.Header, "X-Stainless-OS", fp.StainlessOS)
 	}
 	if fp.StainlessArch != "" {
-		req.Header.Set("X-Stainless-Arch", fp.StainlessArch)
+		setHeaderRaw(req.Header, "X-Stainless-Arch", fp.StainlessArch)
 	}
 	if fp.StainlessRuntime != "" {
-		req.Header.Set("X-Stainless-Runtime", fp.StainlessRuntime)
+		setHeaderRaw(req.Header, "X-Stainless-Runtime", fp.StainlessRuntime)
 	}
 	if fp.StainlessRuntimeVersion != "" {
-		req.Header.Set("X-Stainless-Runtime-Version", fp.StainlessRuntimeVersion)
+		setHeaderRaw(req.Header, "X-Stainless-Runtime-Version", fp.StainlessRuntimeVersion)
 	}
 }
 
